@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ratdoux.OrcaSlicerFullSpectrum</id>
+  <name>Snapmaker Orca FullSpectrum</name>
+  <summary>G-code generator for Snapmaker U1 with Full Spectrum layer blending</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>AGPL-3.0</project_license>
+  <description>
+    <p>
+      Snapmaker Orca FullSpectrum is an open-source FDM slicer forked from
+      Snapmaker Orca / OrcaSlicer, optimised for the Snapmaker U1 multi-color
+      printer. It adds support for virtual mixed-color filaments — new colors
+      created by alternating layers between physical filaments.
+    </p>
+    <ul>
+      <li>Mix two physical filaments into a new apparent color via layer alternation</li>
+      <li>Customisable ratios, gradients, and repeating layer patterns</li>
+      <li>Per-pair Bias control to shift apparent color without changing cadence</li>
+      <li>Advanced dithering controls for segment height fine-tuning</li>
+      <li>Brute-force color mixer to suggest 2-, 3-, or 4-filament combinations</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.ratdoux.OrcaSlicerFullSpectrum.desktop</launchable>
+  <url type="homepage">https://github.com/ratdoux/OrcaSlicer-FullSpectrum</url>
+  <url type="bugtracker">https://github.com/ratdoux/OrcaSlicer-FullSpectrum/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.9.8" date="2026-04-24"/>
+  </releases>
+  <provides>
+    <binary>snapmaker-orca</binary>
+  </provides>
+</component>

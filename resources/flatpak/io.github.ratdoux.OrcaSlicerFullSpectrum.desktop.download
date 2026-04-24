@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Snapmaker Orca FullSpectrum
+Comment=G-code generator for Snapmaker U1 with Full Spectrum layer blending
+Exec=snapmaker-orca %F
+Icon=io.github.ratdoux.OrcaSlicerFullSpectrum
+Terminal=false
+Type=Application
+Categories=Graphics;3DGraphics;Engineering;
+MimeType=model/stl;model/3mf;application/vnd.ms-3mfdocument;application/prs.wavefront-obj;model/obj;application/x-amf;
+StartupNotify=true
+StartupWMClass=Snapmaker-orca

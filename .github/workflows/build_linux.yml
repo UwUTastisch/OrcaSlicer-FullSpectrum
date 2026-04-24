@@ -1,0 +1,294 @@
+################################################################################
+# build_linux.yml
+#
+# Produces two Linux distribution formats on every tag / release:
+#
+#   1. Universal AppImage  — built on ubuntu-22.04 so GLIBC ≥ 2.35 is all that
+#                            is needed (covers Ubuntu 22.04+, Debian 12+, Fedora
+#                            38+, Arch, etc.).  libwebkit2gtk-4.1 and its deps
+#                            are bundled inside the AppDir so users need zero
+#                            extra packages.
+#
+#   2. Flatpak bundle      — built inside a Flatpak SDK container, completely
+#                            distro-agnostic.  Works on any system with Flatpak
+#                            installed regardless of glibc version.
+#
+# Fix for issue #90: AppImage was compiled on Ubuntu 24.04 (GLIBC 2.38) and
+# did not bundle libwebkit2gtk, making it unusable on Ubuntu 22.04 and many
+# other common distros.
+################################################################################
+
+name: Build Linux (AppImage + Flatpak)
+
+on:
+  push:
+    tags: ['v*', '[0-9]*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: 'Attach artifacts to a GitHub Release?'
+        required: false
+        default: 'false'
+
+# Only one run per ref at a time; cancel stale PR runs.
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1 — Universal AppImage
+  # ════════════════════════════════════════════════════════════════════════════
+  appimage:
+    name: AppImage (universal, ubuntu-22.04)
+    runs-on: ubuntu-22.04       # GLIBC 2.35 baseline = widest compatibility
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
+
+      - name: Pull LFS objects
+        run: git lfs pull
+
+      # ── Build dependencies ──────────────────────────────────────────────────
+      # libwebkit2gtk-4.1-dev is installed here so the binary links against
+      # the 22.04 version; we then copy the .so into the AppDir.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential cmake ninja-build git git-lfs \
+            libmspack-dev libgstreamerd-3-dev libsecret-1-dev \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libosmesa6-dev libssl-dev libcurl4-openssl-dev \
+            eglexternalplatform-dev libudev-dev libdbus-1-dev \
+            extra-cmake-modules libgtk2.0-dev libglew-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            texinfo autoconf automake libtool gettext \
+            patchelf file libfuse2
+
+      # ── Build ───────────────────────────────────────────────────────────────
+      - name: Build release
+        run: |
+          chmod +x build_release_linux.sh
+          ./build_release_linux.sh
+
+      # ── Version ─────────────────────────────────────────────────────────────
+      - name: Determine version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            V="$(git describe --tags --always --dirty)"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      # ── Bundle webkit into AppDir ────────────────────────────────────────────
+      #
+      # Core fix for issue #90:  copy libwebkit2gtk-4.1 + JavaScriptCore from
+      # the build host into usr/lib/orca-bundled/ inside the AppDir, then patch
+      # AppRun to prepend that directory to LD_LIBRARY_PATH before exec.
+      #
+      # We intentionally do NOT bundle glibc/libpthread/libm — bundling those
+      # causes loader conflicts that are worse than the original missing-lib
+      # error.  Building on ubuntu-22.04 already pins GLIBC to 2.35.
+      - name: Bundle webkit & transitive deps into AppDir
+        run: |
+          set -euo pipefail
+
+          APPDIR=$(find build -maxdepth 3 -name "*.AppDir" -type d | head -1)
+          [[ -n "$APPDIR" ]] || { echo "No .AppDir found"; exit 1; }
+          echo "AppDir: $APPDIR"
+
+          BUNDLED="$APPDIR/usr/lib/orca-bundled"
+          mkdir -p "$BUNDLED"
+
+          # Libraries we must always bundle (not universally present on systems)
+          MUST_BUNDLE=(
+            libwebkit2gtk-4.1.so.0
+            libjavascriptcoregtk-4.1.so.0
+          )
+
+          for lib in "${MUST_BUNDLE[@]}"; do
+            src=$(ldconfig -p | awk -v l="$lib" '$1==l{print $NF;exit}')
+            [[ -n "$src" ]] || { echo "ERROR: $lib missing on build host"; exit 1; }
+            echo "  + $src"
+            cp "$src" "$BUNDLED/"
+          done
+
+          # Walk transitive deps of webkit; skip anything that must stay system-provided.
+          # Bundling glibc, libpthread, libm, libX*, libGL, libEGL is dangerous.
+          SKIP='linux-vdso|ld-linux|libm\.so|libc\.so|libpthread|librt\.so|libdl\.so|libX|libGL|libEGL|libdrm|libgbm|libxcb'
+          for so in "$BUNDLED"/*.so*; do
+            ldd "$so" 2>/dev/null | awk '/=>/{print $3}' | grep -Ev "$SKIP" | while read dep; do
+              [[ -f "$dep" ]] || continue
+              dest="$BUNDLED/$(basename "$dep")"
+              [[ -f "$dest" ]] && continue
+              echo "  + transitive: $dep"
+              cp "$dep" "$BUNDLED/"
+            done
+          done
+
+          echo "Bundled $(ls "$BUNDLED" | wc -l) libraries"
+
+      # ── Patch AppRun ─────────────────────────────────────────────────────────
+      - name: Patch AppRun
+        run: |
+          set -euo pipefail
+          APPDIR=$(find build -maxdepth 3 -name "*.AppDir" -type d | head -1)
+          APPRUN="$APPDIR/AppRun"
+
+          if file "$APPRUN" | grep -q "ELF"; then
+            # AppRun is the binary itself — wrap it
+            mv "$APPRUN" "$APPDIR/AppRun.real"
+            cat > "$APPRUN" <<'SH'
+          #!/usr/bin/env bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export LD_LIBRARY_PATH="${HERE}/usr/lib/orca-bundled${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          exec "${HERE}/AppRun.real" "$@"
+          SH
+          else
+            # Shell wrapper already exists — inject our export after shebang
+            sed -i '1 a HERE="$(dirname "$(readlink -f "${0}")")"' "$APPRUN"
+            sed -i '2 a export LD_LIBRARY_PATH="${HERE}/usr/lib/orca-bundled${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"' "$APPRUN"
+          fi
+          chmod +x "$APPRUN"
+
+      # ── Repack ───────────────────────────────────────────────────────────────
+      - name: Repack AppImage
+        id: repack
+        run: |
+          set -euo pipefail
+          APPDIR=$(find build -maxdepth 3 -name "*.AppDir" -type d | head -1)
+          V="${{ steps.ver.outputs.version }}"
+          NAME="Snapmaker_Orca_Linux_AppImage_${V}.AppImage"
+
+          # Prefer the appimagetool that the build script may have downloaded;
+          # fall back to fetching it ourselves.
+          if ! command -v appimagetool &>/dev/null; then
+            wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+              -O /tmp/appimagetool
+            chmod +x /tmp/appimagetool
+            TOOL=/tmp/appimagetool
+          else
+            TOOL=appimagetool
+          fi
+
+          ARCH=x86_64 "$TOOL" "$APPDIR" "$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Built: $NAME ($(du -sh "$NAME" | cut -f1))"
+
+      # ── Smoke-test ───────────────────────────────────────────────────────────
+      - name: Smoke test — no unsatisfied deps on build host
+        run: |
+          APPDIR=$(find build -maxdepth 3 -name "*.AppDir" -type d | head -1)
+          BIN=$(find "$APPDIR/bin" "$APPDIR/usr/bin" \
+            \( -name "snapmaker-orca" -o -name "orca" \) -type f 2>/dev/null | head -1)
+          [[ -n "$BIN" ]] || BIN=$(find "$APPDIR" -maxdepth 2 -name "*.so" | head -1)
+          echo "Checking: $BIN"
+          ldd "$BIN" | grep "not found" && { echo "ERROR: unsatisfied deps"; exit 1; } \
+            || echo "All direct dependencies satisfied."
+
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppImage-universal
+          path: ${{ steps.repack.outputs.name }}
+          retention-days: 30
+
+      # ── Attach to release ────────────────────────────────────────────────────
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.upload_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.repack.outputs.name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2 — Flatpak bundle
+  # ════════════════════════════════════════════════════════════════════════════
+  flatpak:
+    name: Flatpak (distro-agnostic)
+    runs-on: ubuntu-22.04
+    container:
+      # Use the official Flatpak SDK image — this is the canonical way to build
+      # Flatpak apps in CI without wrestling with host fuse/bwrap permissions.
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged   # required for bwrap inside the container
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
+
+      - name: Pull LFS objects
+        run: git lfs pull
+
+      # ── Determine version ────────────────────────────────────────────────────
+      - name: Determine version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            V="$(git describe --tags --always --dirty)"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          BUNDLE="Snapmaker_Orca_Linux_Flatpak_${V}_x86_64.flatpak"
+          echo "bundle=$BUNDLE" >> "$GITHUB_OUTPUT"
+
+      # ── Build Flatpak ────────────────────────────────────────────────────────
+      # The manifest lives at scripts/flatpak/io.github.ratdoux.OrcaSlicerFullSpectrum.yml
+      # It builds from the repo source (type: dir) so no external tarballs.
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: ${{ steps.ver.outputs.bundle }}
+          manifest-path: scripts/flatpak/io.github.ratdoux.OrcaSlicerFullSpectrum.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          # Don't mirror screenshots (only needed for Flathub submission)
+          upload-artifact: false   # we handle upload ourselves below
+
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Upload Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Flatpak-bundle
+          path: ${{ steps.ver.outputs.bundle }}
+          retention-days: 30
+
+      # ── Attach to release ────────────────────────────────────────────────────
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.upload_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.ver.outputs.bundle }}
+          body: |
+            ### Linux installation
+
+            **Flatpak (recommended — works on any distro with Flatpak installed):**
+            ```bash
+            flatpak install ./Snapmaker_Orca_Linux_Flatpak_*_x86_64.flatpak
+            ```
+
+            **AppImage (universal — requires GLIBC ≥ 2.35, i.e. Ubuntu 22.04+):**
+            ```bash
+            chmod +x Snapmaker_Orca_Linux_AppImage_*.AppImage
+            ./Snapmaker_Orca_Linux_AppImage_*.AppImage
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

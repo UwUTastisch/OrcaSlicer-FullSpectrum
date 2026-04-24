@@ -1,0 +1,113 @@
+app-id: io.github.ratdoux.OrcaSlicerFullSpectrum
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+command: snapmaker-orca
+
+# Finish args mirror what upstream OrcaSlicer uses, with USB/serial access
+# added for printer communication.
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=x11
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=all                        # GPU + USB serial for printer comms
+  - --filesystem=home
+  - --filesystem=/media
+  - --filesystem=/run/media
+  - --filesystem=/run/spnav.sock:ro     # 3D connexion spacemouse
+  - --talk-name=io.github.ratdoux.OrcaSlicerFullSpectrum.InstanceCheck.*
+  - --system-talk-name=org.freedesktop.UDisks2
+
+# WebKit is only needed if the embedded update / cloud UI is compiled in.
+# Include it here; if the build doesn't need it the runtime already has it.
+add-extensions:
+  org.gnome.Platform.GL:
+    directory: lib/GL
+    merge-dirs: vulkan/icd.d;glvnd/egl_vendor.d;OpenCL/vendors;lib/dri;lib/d3d;vulkan/explicit_layer.d;vulkan/implicit_layer.d
+    subdirectories: true
+    no-autodownload: false
+    autodelete: false
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+  - /share/doc
+  - /share/man
+  - '*.a'
+  - '*.la'
+
+modules:
+  # ── OpenSSL (build dep; runtime usually has it but pin for reproducibility) ──
+  - name: openssl
+    buildsystem: simple
+    build-commands:
+      - ./config --prefix=/app --openssldir=/app/ssl shared
+      - make -j$FLATPAK_BUILDER_N_JOBS
+      - make install_sw
+    sources:
+      - type: archive
+        url: https://www.openssl.org/source/openssl-3.3.2.tar.gz
+        sha256: 2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89f9e908a952c74d6f5a
+
+  # ── nlopt ────────────────────────────────────────────────────────────────────
+  - name: nlopt
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DNLOPT_PYTHON=OFF
+      - -DNLOPT_OCTAVE=OFF
+      - -DNLOPT_MATLAB=OFF
+      - -DNLOPT_GUILE=OFF
+      - -DNLOPT_SWIG=OFF
+    sources:
+      - type: archive
+        url: https://github.com/stevengj/nlopt/archive/refs/tags/v2.8.0.tar.gz
+        sha256: e02a4ff748f9a1814689b942a37cad8c3ddbd24697eabffd06c57b5a3e2db0b8
+
+  # ── OpenVDB ───────────────────────────────────────────────────────────────────
+  - name: openvdb
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DUSE_BLOSC=OFF
+      - -DUSE_EXR=OFF
+      - -DUSE_PNG=OFF
+      - -DOPENVDB_BUILD_BINARIES=OFF
+      - -DOPENVDB_BUILD_UNITTESTS=OFF
+    sources:
+      - type: archive
+        url: https://github.com/AcademySoftwareFoundation/openvdb/archive/refs/tags/v11.0.0.tar.gz
+        sha256: 53d8d04ca3fdebde9a9b8c0d1568c8e04f2f8192f9a456e0e07ee66b04a0bbab
+
+  # ── The slicer itself ─────────────────────────────────────────────────────────
+  # We build from source so Flatpak's sandbox fully wraps it.
+  # The cmake options match build_release_linux.sh but set the install prefix
+  # to /app (Flatpak convention).
+  - name: snapmaker-orca-fullspectrum
+    buildsystem: cmake-ninja
+    builddir: true
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_PREFIX=/app
+      - -DSLIC3R_STATIC=OFF
+      - -DSLIC3R_GTK=3
+      - -DBBL_RELEASE_TO_PUBLIC=1
+      - -DBBL_INTERNAL_TESTING=0
+      - -DDEP_WX_GTK3=ON
+    build-options:
+      env:
+        FLATPAK_BUILDER_N_JOBS: '0'   # let cmake pick
+    post-install:
+      # Install desktop file and icons
+      - install -Dm644 resources/flatpak/io.github.ratdoux.OrcaSlicerFullSpectrum.desktop
+          /app/share/applications/io.github.ratdoux.OrcaSlicerFullSpectrum.desktop
+      - install -Dm644 resources/icons/OrcaSlicer.svg
+          /app/share/icons/hicolor/scalable/apps/io.github.ratdoux.OrcaSlicerFullSpectrum.svg
+      - install -Dm644 resources/flatpak/io.github.ratdoux.OrcaSlicerFullSpectrum.metainfo.xml
+          /app/share/metainfo/io.github.ratdoux.OrcaSlicerFullSpectrum.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..   # root of the repo (two levels up from scripts/flatpak/)
